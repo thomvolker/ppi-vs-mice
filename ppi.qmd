@@ -1,0 +1,226 @@
+---
+title: "Prediction-powered inference with `mice`"
+author: Thom Benjamin Volker
+date: "03-06-2024"
+format: 
+  html:
+    df-print: kable
+---
+
+# Introduction
+
+Prediction-powered inference is a framewerk for performing inference on a dataset where a gold-standard measure for a variable is unavailable for the majority of the data. However, the relationships between other variables and the variable containing missing data can be used to impute or predict the missing values. Subsequently, the predictions can be used to perform inference on the dataset, taking into account that part of the information is missing, and thus that the variance around the estimates should be corrected. 
+
+In this document, we compare prediction-powered inference with multiple imputation using the `mice` package. 
+
+# Simulations
+
+```{r}
+library(mice)
+library(purrr)
+library(tidyverse)
+library(furrr)
+
+set.seed(123)
+
+P <- 3
+m <- 1:P
+S <- rWishart(1, P, diag(P))[,,1]
+
+# Correlation matrix
+S / sqrt(diag(S) %*% t(diag(S)))
+
+# Regression coefficients
+b <- c(1, 0.5, 0.3, 0.1)
+
+sim_data <- function(nobs, nmis, m, S, b) {
+  
+  P <- ncol(S)
+  
+  Xobs <- rnorm(nobs*P) |> matrix(nobs) %*% chol(S) + matrix(m, nobs, P, byrow = TRUE)
+  Xmis <- rnorm(nmis*P) |> matrix(nmis) %*% chol(S) + matrix(m, nmis, P, byrow = TRUE)
+  Yobs <- cbind(1, Xobs) %*% b + rnorm(nobs)
+  Ymis <- rep(NA, nmis)
+  
+  data.frame(rbind(Xobs, Xmis),
+             Y = c(Yobs, Ymis))
+}
+```
+
+## Correct prediction model
+
+```{r}
+classical_mean <- function(dat) {
+  nobs <- sum(!is.na(dat$Y))
+  Ymean <- mean(dat$Y, na.rm = TRUE)
+  Yvar  <- var(dat$Y, na.rm = TRUE) / nobs
+  # Return CI
+  Ymean + c(-1, 1) * qt(0.975, nobs-1) * sqrt(Yvar)
+}
+
+ppi_mean <- function(dat, alpha = 0.05, adj = FALSE) {
+  Yna <- is.na(dat$Y)
+  nobs <- sum(!Yna)
+  fit <- lm(Y ~ ., data = dat)
+  Yobs_pred <- predict(fit, newdata = dat[!Yna, ])
+  Ymis_pred <- predict(fit, newdata = dat[Yna, ])
+  
+  thetahat_obs <- mean(dat$Y[!Yna])
+  thetahat_mis <- mean(Ymis_pred)
+  thetahat_pp  <- thetahat_mis - mean(Yobs_pred - dat$Y[!Yna])
+  
+  varobs <- var(dat$Y[!Yna]) / nobs
+  varmis <- var(Ymis_pred) / sum(Yna)
+  varpp  <- varmis + 1/nobs * var(Yobs_pred - dat$Y[!Yna])
+  
+  # Return CI
+  df <- nobs - length(coef(fit)) - 1
+  teststat <- ifelse(adj, qt(0.975, df), qnorm(1-alpha/2))
+  thetahat_pp + c(-1, 1) * teststat * sqrt(varpp)
+}
+
+mice_mean <- function(dat) {
+  imp <- mice(dat, 
+              m = 50,
+              maxit = 10,
+              method = "norm", 
+              eps = 0, 
+              print = FALSE)
+  imp <- complete(imp, "all")
+  means <- map_dbl(imp, ~mean(.x$Y))
+  vars  <- map_dbl(imp, ~var(.x$Y)/nrow(.x))
+  pooled <- pool.scalar(means, vars, n = nrow(dat))
+  
+  # Return CI
+  pooled$qbar + c(-1, 1) * qt(0.975, pooled$df) * sqrt(pooled$t)
+}
+```
+
+### Large data set
+
+```{r}
+plan(multisession, workers = 16)
+
+nsim <- 100
+sim <- tibble(
+  sim = 1:nsim
+)
+
+EY <- c(1, m) %*% b
+
+sim_large <- mutate(sim, dat = map(sim, ~sim_data(100, 9900, m, S, b)))
+sim_large <- mutate(sim_large,
+                    classical = map(dat, classical_mean),
+                    ppi = map(dat, ppi_mean),
+                    ppiadj = map(dat, ppi_mean, adj = TRUE),
+                    mice = future_map(dat, 
+                                      mice_mean, 
+                                      .options = furrr_options(seed = TRUE),
+                                      .progress = TRUE))
+
+sim_large <- sim_large |>
+  mutate(across(.cols = c(classical, ppi, ppiadj, mice), 
+                .fns = list(est = ~map_dbl(.x, \(ci) (ci[1] + ci[2])/2),
+                            cov = ~map_lgl(.x, \(ci) ci[1] < EY & EY < ci[2]),
+                            ciw = ~map_dbl(.x, \(ci) ci[2] - ci[1])))
+         )
+
+sim_large |>
+  summarize(across(.cols = ends_with(c("est", "cov", "ciw")), 
+                   .fns = mean)
+  ) |> pivot_longer(cols = everything(),
+                    names_sep = "_",
+                    names_to = c("method", "stat")) |>
+  pivot_wider(names_from = stat, values_from = value)
+```
+
+### Small data set
+
+```{r}
+sim_small <- mutate(sim, dat = map(sim, ~sim_data(20, 980, m, S, b)))
+sim_small <- mutate(sim_small,
+                    classical = map(dat, classical_mean),
+                    ppi = map(dat, ppi_mean),
+                    ppiadj = map(dat, ppi_mean, adj = TRUE),
+                    mice = future_map(dat, 
+                                      mice_mean, 
+                                      .options = furrr_options(seed = TRUE),
+                                      .progress = TRUE))
+
+sim_small <- sim_small |>
+  mutate(across(.cols = c(classical, ppi, ppiadj, mice), 
+                .fns = list(est = ~map_dbl(.x, \(ci) (ci[1] + ci[2])/2),
+                            cov = ~map_lgl(.x, \(ci) ci[1] < EY & EY < ci[2]),
+                            ciw = ~map_dbl(.x, \(ci) ci[2] - ci[1])))
+         )
+
+sim_small |>
+  summarize(across(.cols = ends_with(c("est", "cov", "ciw")), 
+                   .fns = mean)
+  ) |> pivot_longer(cols = everything(),
+                    names_sep = "_",
+                    names_to = c("method", "stat")) |>
+  pivot_wider(names_from = stat, values_from = value)
+```
+
+## Incorrect prediction model
+
+### Large data set
+
+
+```{r}
+sim_large_inc <- mutate(sim, dat = map(sim, ~sim_data(100, 9900, m, S, b)[,-1]))
+sim_large_inc <- mutate(sim_large_inc,
+                        classical = map(dat, classical_mean),
+                        ppi = map(dat, ppi_mean),                    
+                        ppiadj = map(dat, ppi_mean, adj = TRUE),
+                        mice = future_map(dat, 
+                                          mice_mean, 
+                                          .options = furrr_options(seed = TRUE),
+                                          .progress = TRUE))
+
+sim_large_inc <- sim_large_inc |>
+  mutate(across(.cols = c(classical, ppi, ppiadj, mice), 
+                .fns = list(est = ~map_dbl(.x, \(ci) (ci[1] + ci[2])/2),
+                            cov = ~map_lgl(.x, \(ci) ci[1] < EY & EY < ci[2]),
+                            ciw = ~map_dbl(.x, \(ci) ci[2] - ci[1])))
+         )
+
+sim_large_inc |>
+  summarize(across(.cols = ends_with(c("est", "cov", "ciw")), 
+                   .fns = mean)
+  ) |> pivot_longer(cols = everything(),
+                    names_sep = "_",
+                    names_to = c("method", "stat")) |>
+  pivot_wider(names_from = stat, values_from = value)
+```
+
+### Small data set
+
+
+```{r}
+sim_small_inc <- mutate(sim, dat = map(sim, ~sim_data(20, 980, m, S, b)[,-1]))
+sim_small_inc <- mutate(sim_small_inc,
+                        classical = map(dat, classical_mean),
+                        ppi = map(dat, ppi_mean),
+                        ppiadj = map(dat, ppi_mean, adj = TRUE),
+                        mice = future_map(dat, 
+                                          mice_mean, 
+                                          .options = furrr_options(seed = TRUE),
+                                          .progress = TRUE))
+
+sim_small_inc <- sim_small_inc |>
+  mutate(across(.cols = c(classical, ppi, ppiadj, mice), 
+                .fns = list(est = ~map_dbl(.x, \(ci) (ci[1] + ci[2])/2),
+                            cov = ~map_lgl(.x, \(ci) ci[1] < EY & EY < ci[2]),
+                            ciw = ~map_dbl(.x, \(ci) ci[2] - ci[1])))
+         )
+
+sim_small_inc |>
+  summarize(across(.cols = ends_with(c("est", "cov", "ciw")), 
+                   .fns = mean)
+  ) |> pivot_longer(cols = everything(),
+                    names_sep = "_",
+                    names_to = c("method", "stat")) |>
+  pivot_wider(names_from = stat, values_from = value)
+```
